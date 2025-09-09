@@ -1,18 +1,47 @@
 use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, span, warn};
-use tracing_subscriber;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::Registry;
+use tracing_subscriber::fmt::time::ChronoLocal;
+use tracing_subscriber::prelude::*;
+use tracing_tree::HierarchicalLayer;
 
-// Initialize tracing subscriber (once)
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+use tracing_appender::non_blocking::WorkerGuard;
+
+// Keep the guard alive for the whole program
+static FILE_GUARD: Lazy<Mutex<Option<WorkerGuard>>> = Lazy::new(|| Mutex::new(None));
+
+// --------------------- Init Tracing ---------------------
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(Level::TRACE)
-        .with_target(false)
+    // File appender: minute rotation (for quick testing)
+    let file_appender: RollingFileAppender = tracing_appender::rolling::minutely("logs", "app.log");
+    let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Store guard globally so it isn't dropped
+    *FILE_GUARD.lock().unwrap() = Some(guard);
+
+    // Console logs with hierarchical tree view
+    let console_layer = HierarchicalLayer::new(2)
+        .with_targets(false)
+        .with_writer(std::io::stdout);
+
+    // File logs: structured, timestamped
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking_file)
+        .with_ansi(false)
         .with_thread_ids(true)
         .with_file(true)
         .with_line_number(true)
-        .with_ansi(true)
-        .init();
+        .with_timer(ChronoLocal::rfc_3339());
+
+    // Combine console + file layers
+    let subscriber = Registry::default().with(console_layer).with(file_layer);
+
+    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
+// --------------------- App Logic ---------------------
 
 #[instrument(name = "user_registration", skip(password))]
 async fn register_user(user_id: u64, email: &str, password: &str) -> Result<(), String> {
@@ -114,6 +143,17 @@ async fn api_request_handler(request_id: String, endpoint: &str) {
     );
 }
 
+#[instrument]
+async fn error_prone_function() -> Result<String, Box<dyn std::error::Error>> {
+    debug!("Starting potentially failing operation");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access denied");
+    error!("Operation failed: {}", err);
+    Err(Box::new(err))
+}
+
+// --------------------- Main ---------------------
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
@@ -129,16 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     api_request_handler("req-001".into(), "/api/users").await;
     api_request_handler("req-002".into(), "/api/posts").await;
 
+    if let Err(e) = error_prone_function().await {
+        error!("Error occurred in error_prone_function: {}", e);
+    }
+
     info!("Application shutting down");
     Ok(())
-}
-
-#[instrument]
-async fn error_prone_function() -> Result<String, Box<dyn std::error::Error>> {
-    debug!("Starting potentially failing operation");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access denied");
-    error!("Operation failed: {}", err);
-    Err(Box::new(err))
 }
